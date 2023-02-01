@@ -1,0 +1,178 @@
+Load the libraries 
+```{r,warning=FALSE}
+library(Seurat)
+library(ggplot2)
+library(CellChat)
+library(SingleR)
+library(data.table)
+library(celldex)
+library(pathfindR)
+library(future)
+library(ggalluvial)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(VennDiagram)
+library(ggvenn)
+library(RColorBrewer)
+```
+
+load the objects
+```{r}
+load('r_objects/whole_integration_obj.Rdata')
+load('r_objects/marker_list.Rdata')
+load("r_objects/hcc_deg.Rdata")
+load("r_objects/icc_deg.Rdata")
+```
+Preprocessing was performed before Integration, "whole_integration_obj.Rdata" 
+Name of the integrated object 
+Step1. Visualisation of Major features in the integrated ObjectI
+```{r}
+integration_obj[['Percent_Mito_genes']]  <- PercentageFeatureSet(integration_obj,pattern = "^MT-",assay = "RNA")
+integration_obj[['Percent_ribosomal_protein_genes']] = PercentageFeatureSet(integration_obj,pattern = "^RP[SL]",assay = "RNA") 
+#only consider those cells having mitochondial genes less than 50 percent
+valid_mito_genes <- WhichCells(integration_obj,expression = Percent_Mito_genes < 50 )
+integration_obj <-  subset(integration_obj,cells = valid_mito_genes)
+violin_plot <- VlnPlot(integration_obj,
+                       features =c('Percent_Mito_genes',"nCount_RNA","nFeature_RNA",'Percent_ribosomal_protein_genes'),
+                       pt.size = FALSE, group.by = "sample_type")
+
+```
+Step. High variance gene identification, dimension reduction and clustering
+```{r}
+integration_obj <-FindVariableFeatures(integration_obj,nfeatures = 4000, selection.method = "vst")
+integration_obj <- Seurat::ScaleData(integration_obj)
+integration_obj <- Seurat::RunPCA(integration_obj,features = VariableFeatures(integration_obj))
+integration_obj <-  FindNeighbors(integration_obj,dims = 1:50)
+integration_obj <- FindClusters(integration_obj)
+```
+Visualisation 
+```{r}
+umap_sample_type <- DimPlot(integration_obj,reduction = 'umap',group.by = 'sample_type')
+umap_seu_clust <- DimPlot(integration_obj,reduction = 'umap',group.by = 'seurat_clusters')
+tsne_sample_type <- DimPlot(integration_obj,reduction = 'tsne',group.by = 'sample_type')
+tsne_seu_clust <- DimPlot(integration_obj,reduction = 'tsne',group.by = 'seurat_clusters',label = T)
+```
+celltype annotation 
+```{r}
+DefaultAssay(integration_obj)="RNA"
+ref <- HumanPrimaryCellAtlasData()
+single_cell_exp <- as.SingleCellExperiment(integration_obj)
+integration_obj <- SetIdent(integration_obj, value = integration_obj@meta.data$seurat_clusters )
+single_r_prediction <- SingleR::SingleR(test = single_cell_exp,
+                                        ref = ref,
+                                        clusters =Idents(integration_obj)  ,
+                                        labels = ref$label.main)
+single_r_prediction <- as.data.frame(single_r_prediction)
+```
+Finding marker genes for cell clusters and Cell-annotation
+```{r}
+Idents(integration_obj) <-  integration_obj$cell_type
+cell_type_labels <- unique(integration_obj$cell_type)
+marker_list<- list()
+for (celltype in cell_type_labels) {
+  temp_mark <- FindMarkers(integration_obj,ident.1 = celltype,min.pct=0.25,min.diff.pct = 0)
+  marker_list[[celltype]] <- temp_mark
+}
+save(marker_list,file='R_objects/marker_list.Rdata')
+
+#Heatmap of DEGS
+no_of_celltypes <- length(marker_list)
+marker_gene_clusters <- data.frame(matrix(nrow = no_of_celltypes,ncol = 21))
+colnames(marker_gene_clusters) <- c('Celltype')
+#marker_gene_clusters$cell_types <- single_r_prediction$labels
+for(num in 1:no_of_celltypes ){
+  ct <- cell_type_labels[num]
+  temp_marker <- marker_list[[ct]]
+  marker_gene_clusters[num,1] <- ct
+  marker_gene_df <- head(temp_marker[sort(temp_marker$avg_log2FC,decreasing = T,index.return=T)$ix,],20)
+  marker_gene_clusters[num,2:21] <- rownames(marker_gene_df)
+}
+
+```
+Differential gene expression analysis
+```{r}
+hcc_deg <- hcc_deg[abs(hcc_deg$avg_log2FC)> 2.0,]
+icc_deg <- icc_deg[abs(icc_deg$avg_log2FC)> 2.0,]
+```
+Cell cell communication analysis
+```{r}
+#.......Cell chat object creation
+cell_chat_obj <-  CellChat::createCellChat(object = integration_obj,
+                                             group.by = 'cell_type',assay = 'RNA')
+
+#.......call cell chat database
+cell_chat_db = CellChatDB.human
+dbs_in_cellchat <- showDatabaseCategory(cell_chat_db)   #what signaling datas are there 
+#Select the database 
+cell_chat_db.use <- subsetDB(cell_chat_db,
+                             search = "Secreted Signaling")
+#cell_chat_db.use <- subsetDB(cell_chat_db)
+#integrate database to our cell chat object
+cell_chat_obj@DB <- CellChatDB.human
+
+#.......Downstream cell chat analysis 
+cell_chat_obj <- subsetData(cell_chat_obj)
+cell_chat_obj <- identifyOverExpressedGenes(cell_chat_obj)
+cell_chat_obj <- identifyOverExpressedInteractions(cell_chat_obj)
+cell_chat_obj <- projectData(cell_chat_obj,PPI.human)
+#Compute communication probability of  between cells of clusters 
+cell_chat_obj <- computeCommunProb(cell_chat_obj)   #What are the pathways present 
+cell_chat_obj <- filterCommunication(cell_chat_obj,min.cells = 10)
+
+df.net <- subsetCommunication(cell_chat_obj)
+
+#compute probability of pathways
+cell_chat_obj <- computeCommunProbPathway(cell_chat_obj)
+
+#After calculating communication networks gonna aggregate(sum) it 
+cell_chat_obj <- aggregateNet(cell_chat_obj)
+interaction_dfs <- cell_chat_obj@net
+
+#...............plot the interactions 
+group_size <- as.numeric(table(cell_chat_obj@idents))
+
+#...............plot1.No of interactions
+interaction_plot <- netVisual_circle(cell_chat_obj@net$count,
+                                     vertex.weight = group_size,
+                                     weight.scale = T,
+                                     label.edge = F)
+```
+Gene enrichment Analysis 
+```{r}
+#HCC.........................................................................
+hcc_deg_up <- hcc_deg[hcc_deg$avg_log2FC>1.5,]
+hcc_up_regulated <- data.frame(rownames(hcc_deg_up),hcc_deg_up$avg_log2FC,hcc_deg_up$p_val)
+colnames(hcc_up_regulated) <- c("Gene.symbol","logFC","adj.P.Val")
+hcc_up_df <- run_pathfindR(hcc_up_regulated, iterations = 5, n_processes = 2)
+hcc_up_gse <- enrichGO(hcc_up_regulated$Gene.symbol, 
+             ont ="CC", 
+             keyType = "SYMBOL",OrgDb = 'org.Hs.eg.db')
+hcc_up_chart <- enrichment_chart(hcc_up_df,top_terms = 10)
+hcc_up_chart <- barplot(hcc_up_gse,drop=T,showCategory = 10)+ggtitle("HCC up regulated")
+hcc_deg_down <- hcc_deg[hcc_deg$avg_log2FC<(-1.5),]
+hcc_down_regulated <- data.frame(rownames(hcc_deg_down),hcc_deg_down$avg_log2FC,hcc_deg_down$p_val)
+colnames(hcc_down_regulated) <- c("Gene.symbol","logFC","adj.P.Val")
+hcc_down_gse <- enrichGO(hcc_down_regulated$Gene.symbol, 
+             ont ="CC", 
+             keyType = "SYMBOL",OrgDb = 'org.Hs.eg.db')
+hcc_down_chart <- barplot(hcc_down_gse,drop=T,showCategory = 10)+ggtitle("HCC down regulated")
+#ICC........................................................................
+#up_regulate
+icc_deg_up <- icc_deg[icc_deg$avg_log2FC>2,]
+icc_up_regulated <- data.frame(rownames(icc_deg_up),icc_deg_up$avg_log2FC,icc_deg_up$p_val)
+colnames(icc_up_regulated) <- c("Gene.symbol","logFC","adj.P.Val")
+icc_up_gse <- enrichGO(icc_up_regulated$Gene.symbol, 
+             ont ="CC", 
+             keyType = "SYMBOL",OrgDb = 'org.Hs.eg.db')
+icc_up_chart <- barplot(icc_up_gse,drop=T,showCategory = 10)+ggtitle("ICC up regulated")
+#down_regulate
+icc_deg_down <- icc_deg[icc_deg$avg_log2FC<(-2),]
+icc_down_regulated <- data.frame(rownames(icc_deg_down),icc_deg_down$avg_log2FC,icc_deg_down$p_val)
+colnames(icc_down_regulated) <- c("Gene.symbol","logFC","adj.P.Val")
+icc_down_gse <- enrichGO(icc_down_regulated$Gene.symbol, 
+             ont ="CC", 
+             keyType = "SYMBOL",OrgDb = 'org.Hs.eg.db')
+icc_down_chart <- barplot(icc_down_gse,drop=T,showCategory = 10)+ggtitle("ICC down regulated")
+```
+Thank you
+
